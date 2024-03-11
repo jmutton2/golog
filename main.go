@@ -7,21 +7,54 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"errors"
 	"net/http"
 	"time"
 
 	elasticsearch "github.com/elastic/go-elasticsearch/v7"
 	"github.com/elastic/go-elasticsearch/v7/esapi"
-	 "github.com/google/uuid"
+	"github.com/google/uuid"
+	"github.com/julienschmidt/httprouter"
 )
 
 type LogLevel int64 
 
+func (l *LogLevel) UnmarshalJSON(b []byte) error {
+	var levelString string
+	err := json.Unmarshal(b, &levelString)
+	if err != nil {
+		return err
+	}
+
+	switch levelString {
+	case "EMERGENCY":
+		*l = EMERGENCY
+	case "CRITICAL":
+		*l = CRITICAL
+	case "ERROR":
+		*l = ERROR
+	case "ALERT":
+		*l = ALERT
+	case "WARNING":
+		*l = WARNING
+	case "NOTICE":
+		*l = NOTICE
+	case "INFORMATIONAL":
+		*l = INFORMATIONAL
+	case "DEBUG":
+		*l = DEBUG
+	default:
+		return errors.New("invalid log level")
+	}
+
+	return nil
+}
+
 const (
 	EMERGENCY LogLevel = iota
-	ALERT LogLevel = iota
 	CRITICAL LogLevel = iota
 	ERROR LogLevel = iota
+	ALERT LogLevel = iota
 	WARNING LogLevel = iota
 	NOTICE LogLevel = iota
 	INFORMATIONAL LogLevel = iota
@@ -35,8 +68,8 @@ type Log struct {
 	Message string `json:"message"`
 }
 
-func handleLog(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+func handleLog(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+	if r.URL.Path != "/api/v1/logs" {
 		http.NotFound(w, r)
 		return
 	}
@@ -65,6 +98,59 @@ func handleLog(w http.ResponseWriter, r *http.Request) {
 		}
 
 		fmt.Println(string(prettyJSON.Bytes()))
+	}
+}
+
+func handleCreate(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	ctx := context.Background()
+
+	cfg := elasticsearch.Config{
+		Addresses: []string{
+			"http://localhost:9200",
+		},
+	}
+
+	client, err := elasticsearch.NewClient(cfg)
+	if err != nil {
+		log.Fatalf("Error creating the client: %s", err)
+	}
+
+	var req createRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		log.Println(err)
+		return
+	}
+
+	sample_log := Log{Timestamp: time.Now().String(), Correlation_id: req.Correlation_id, Severity: req.Severity, Message: req.Message}
+
+	_, err = Insert(client, ctx, sample_log)
+	if err != nil {
+		log.Fatalf("Error inserting doc: %s", err)
+	}
+
+	fmt.Println("Log Added")
+	fmt.Println(sample_log)
+
+}
+
+func handleGet(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
+	ctx := context.Background()
+
+	cfg := elasticsearch.Config{
+		Addresses: []string{
+			"http://localhost:9200",
+		},
+	}
+
+	client, err := elasticsearch.NewClient(cfg)
+	if err != nil {
+		log.Fatalf("Error creating the client: %s", err)
+	}
+
+	err = FindOne(client, ctx, p.ByName("id"))
+	if err != nil {
+		log.Fatalf("Error finding one: %s", err)
 	}
 
 }
@@ -102,10 +188,10 @@ func Insert(client *elasticsearch.Client, ctx context.Context, post Log) (uuid.U
 	return id, nil 
 }
 
-func FindOne(client *elasticsearch.Client, ctx context.Context, id uuid.UUID) error {
+func FindOne(client *elasticsearch.Client, ctx context.Context, id string) error {
 	req := esapi.GetRequest{
 		Index: "logs",
-		DocumentID: id.String(),
+		DocumentID: id,
 	}
 
 	res, err := req.Do(ctx, client)
@@ -122,13 +208,12 @@ func FindOne(client *elasticsearch.Client, ctx context.Context, id uuid.UUID) er
 		return fmt.Errorf("get: response: %s", res.String())
 	}
 
-	var m Log;
-
-	if err := json.NewDecoder(res.Body).Decode(&m); err != nil {
+	bytes, err := io.ReadAll(res.Body)
+	if err != nil {
 		return fmt.Errorf("find one: decode: %w", err)
 	}
 
-	log.Println(m)
+	fmt.Println(string(bytes))
 
 	return nil
 }
@@ -160,12 +245,11 @@ func main() {
 	defer res.Body.Close()
 	log.Println(res)
 
-	//res, err = client.Indices.Create("logs")
-	//if err != nil {
-	//	log.Fatalf("Error Create Index: %s", err)
-	//}
-	//log.Println(res)
-
+	res, err = client.Indices.Create("logs")
+	if err != nil {
+		log.Fatalf("Error Create Index: %s", err)
+	}
+	log.Println(res)
 
 	sample_log := Log{Timestamp: time.Now().String(), Correlation_id: "admin_testing", Severity: INFORMATIONAL, Message: "This is a test log."}
 
@@ -174,18 +258,30 @@ func main() {
 		log.Fatalf("Error inserting doc: %s", err)
 	}
 
-	err = FindOne(client, ctx, id)
+	err = FindOne(client, ctx, id.String())
 	if err != nil {
 		log.Fatalf("Error finding one: %s", err)
 	}
 
-	res, err = client.Indices.Delete(index_name)
-	if err != nil {
-		log.Fatalf("Error getting response: %s", err)
-	}
-	log.Println(res)
-	
+	//res, err = client.Indices.Delete(index_name)
+	//if err != nil {
+	//	log.Fatalf("Error getting response: %s", err)
+	//}
+	//log.Println(res)
 
-	http.HandleFunc("/", handleLog)
-	http.ListenAndServe(":8081", nil)
+	router := httprouter.New()
+	router.GET("/api/v1/logs", handleLog)
+	router.GET("/api/v1/logs/:id", handleGet)
+	router.POST("/api/v1/logs", handleCreate)
+
+	log.Fatal(http.ListenAndServe(":8080", router))
 }
+
+
+
+
+
+
+
+
+
