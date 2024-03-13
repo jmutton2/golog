@@ -62,7 +62,7 @@ const (
 )
 
 type Log struct {
-	Timestamp string `json:"timestamp"`
+	Timestamp time.Time `json:"timestamp"`
 	Correlation_id string `json:"correlation_id"`
 	Severity LogLevel `json:"severity"`
 	Message string `json:"message"`
@@ -122,15 +122,21 @@ func handleCreate(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		return
 	}
 
-	sample_log := Log{Timestamp: time.Now().String(), Correlation_id: req.Correlation_id, Severity: req.Severity, Message: req.Message}
+	sample_log := Log{Timestamp: time.Now(), Correlation_id: req.Correlation_id, Severity: req.Severity, Message: req.Message}
 
-	_, err = Insert(client, ctx, sample_log)
+	id, err := Insert(client, ctx, sample_log)
 	if err != nil {
 		log.Fatalf("Error inserting doc: %s", err)
 	}
 
+	response := createResponse{id.String()}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(response)
+
 	fmt.Println("Log Added")
-	fmt.Println(sample_log)
+	fmt.Println(id)
 
 }
 
@@ -148,10 +154,21 @@ func handleGet(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
 		log.Fatalf("Error creating the client: %s", err)
 	}
 
-	err = FindOne(client, ctx, p.ByName("id"))
+	doc, err := FindOne(client, ctx, p.ByName("id"))
 	if err != nil {
-		log.Fatalf("Error finding one: %s", err)
+		fmt.Printf("Error finding one: %s", err)
 	}
+
+	response := getResponse{
+		Timestamp: doc.Timestamp,
+		Correlation_id: doc.Correlation_id,
+		Severity: doc.Severity,
+		Message: doc.Message,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(response)
 
 }
 
@@ -185,10 +202,13 @@ func Insert(client *elasticsearch.Client, ctx context.Context, post Log) (uuid.U
 		return id, fmt.Errorf("insert: response: %s", res.String())
 	}
 
+	bytes, err := io.ReadAll(res.Body)
+	fmt.Println(string(bytes))
+
 	return id, nil 
 }
 
-func FindOne(client *elasticsearch.Client, ctx context.Context, id string) error {
+func FindOne(client *elasticsearch.Client, ctx context.Context, id string) (Log, error){
 	req := esapi.GetRequest{
 		Index: "logs",
 		DocumentID: id,
@@ -196,26 +216,32 @@ func FindOne(client *elasticsearch.Client, ctx context.Context, id string) error
 
 	res, err := req.Do(ctx, client)
 	if err != nil {
-		return fmt.Errorf("get: request: %w", err)
+		return Log{}, fmt.Errorf("get: request: %w", err)
 	}
 	defer res.Body.Close()
  
 	if res.StatusCode == 404 {
-		return fmt.Errorf("get 404: response: %s", res.String())
+		return Log{}, fmt.Errorf("get 404: response: %s", res.String())
 	}
  
 	if res.IsError() {
-		return fmt.Errorf("get: response: %s", res.String())
+		return Log{}, fmt.Errorf("get: response: %s", res.String())
 	}
 
 	bytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return fmt.Errorf("find one: decode: %w", err)
+		return Log{}, fmt.Errorf("find one: decode: %w", err)
 	}
 
 	fmt.Println(string(bytes))
 
-	return nil
+	log := Log{}
+	err = json.Unmarshal(bytes, &log)
+	if err != nil {
+		fmt.Printf("err = %v\n", err)
+	}
+
+	return log, nil
 }
 
 func main() {
@@ -251,26 +277,27 @@ func main() {
 	}
 	log.Println(res)
 
-	sample_log := Log{Timestamp: time.Now().String(), Correlation_id: "admin_testing", Severity: INFORMATIONAL, Message: "This is a test log."}
+	sample_log := Log{Timestamp: time.Now(), Correlation_id: "admin_testing", Severity: INFORMATIONAL, Message: "This is a test log."}
 
 	id, err := Insert(client, ctx, sample_log)
 	if err != nil {
 		log.Fatalf("Error inserting doc: %s", err)
 	}
 
-	err = FindOne(client, ctx, id.String())
+	_, err = FindOne(client, ctx, id.String())
 	if err != nil {
 		log.Fatalf("Error finding one: %s", err)
 	}
 
-	//res, err = client.Indices.Delete(index_name)
-	//if err != nil {
-	//	log.Fatalf("Error getting response: %s", err)
-	//}
-	//log.Println(res)
+	res, err = client.Indices.Delete(index_name)
+	if err != nil {
+		log.Fatalf("Error getting response: %s", err)
+	}
+	log.Println(res)
+
+	//curl --request POST "localhost:8080/api/v1/logs" -d '{"correlation_id":"admin_test", "severity":"INFORMATIONAL", "message":"curl test log"}'
 
 	router := httprouter.New()
-	router.GET("/api/v1/logs", handleLog)
 	router.GET("/api/v1/logs/:id", handleGet)
 	router.POST("/api/v1/logs", handleCreate)
 
